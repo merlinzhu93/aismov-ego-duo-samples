@@ -1,0 +1,61 @@
+name: Assemble ColorRGB samples
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SAMPLE_TAG: colorrgb-2026-10-22
+    steps:
+      - name: Download verified source parts
+        run: |
+          mkdir -p parts assembled
+          gh release download "$SAMPLE_TAG" --repo "$GITHUB_REPOSITORY" --pattern 'part-*.bin' --pattern 'colorrgb-parts-manifest.json' --dir parts
+      - name: Reassemble and verify original files
+        shell: python
+        run: |
+          import hashlib, json
+          from pathlib import Path
+          manifest = json.loads(Path('parts/colorrgb-parts-manifest.json').read_text())
+          for file in manifest['files']:
+              assert Path(file['name']).name == file['name']
+              target = Path('assembled') / file['name']
+              total = hashlib.sha256()
+              with target.open('wb') as output:
+                  for chunk in file['chunks']:
+                      assert Path(chunk['name']).name == chunk['name']
+                      data = (Path('parts') / chunk['name']).read_bytes()
+                      assert len(data) == chunk['size']
+                      assert hashlib.sha256(data).hexdigest() == chunk['sha256']
+                      output.write(data)
+                      total.update(data)
+              assert target.stat().st_size == file['size']
+              assert total.hexdigest() == file['sha256']
+              print('Verified', file['name'], file['size'])
+      - name: Upload original videos and ColorRGB download packages
+        run: gh release upload "$SAMPLE_TAG" assembled/* --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Verify final release and remove temporary parts
+        shell: python
+        run: |
+          import json, os, subprocess
+          from pathlib import Path
+          repo = os.environ['GITHUB_REPOSITORY']
+          tag = os.environ['SAMPLE_TAG']
+          releases = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + repo + '/releases']))
+          release = next(item for item in releases if item['tag_name'] == tag)
+          pages = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + repo + '/releases/' + str(release['id']) + '/assets?per_page=100', '--paginate', '--slurp']))
+          assets = [item for page in pages for item in page]
+          expected = json.loads(Path('parts/colorrgb-parts-manifest.json').read_text())['files']
+          for file in expected:
+              asset = next(item for item in assets if item['name'] == file['name'])
+              assert asset['state'] == 'uploaded' and asset['size'] == file['size']
+              assert asset['digest'] == 'sha256:' + file['sha256']
+          for asset in assets:
+              if asset['name'].startswith('part-') or asset['name'] == 'colorrgb-parts-manifest.json':
+                  subprocess.run(['gh', 'api', '--method', 'DELETE', 'repos/' + repo + '/releases/assets/' + str(asset['id'])], check=True)
+      - name: Publish verified samples
+        run: gh release edit "$SAMPLE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
